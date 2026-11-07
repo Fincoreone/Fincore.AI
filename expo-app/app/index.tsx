@@ -5,6 +5,12 @@ import { useRouter } from 'expo-router';
 import { useUser } from '../contexts/UserContext';
 import { useTheme, type Theme } from '../contexts/ThemeContext';
 
+// The tagline animation finishes 1050ms after mount (700ms delay + 350ms).
+// Hold the splash at least this long so it is never cut off, but no longer:
+// the wait is measured from when the splash appeared, not from when the
+// user data finished loading, so a slow network never adds to it.
+const MIN_SPLASH_MS = 1100;
+
 export default function SplashScreen() {
   const t = useTheme();
   const styles = useMemo(() => makeStyles(t), [t]);
@@ -15,6 +21,7 @@ export default function SplashScreen() {
   const logoScale = useRef(new Animated.Value(0.8)).current;
   const taglineOpacity = useRef(new Animated.Value(0)).current;
   const taglineTranslate = useRef(new Animated.Value(10)).current;
+  const mountedAt = useRef(Date.now());
 
   useEffect(() => {
     Animated.sequence([
@@ -50,13 +57,18 @@ export default function SplashScreen() {
     ]).start();
   }, []);
 
-  // Navigate after animation completes AND user state is loaded
+  // Navigate once user state is loaded AND the splash has been visible for
+  // MIN_SPLASH_MS. Whichever finishes later decides; the two never stack.
   useEffect(() => {
     if (isLoading) return;
 
     const hasStartedOnboarding = Boolean(userName || userEmail || authProvider !== 'anonymous');
+    const remaining = Math.max(0, MIN_SPLASH_MS - (Date.now() - mountedAt.current));
 
     const timer = setTimeout(() => {
+      if (__DEV__) {
+        console.log(`[splash] navigating after ${Date.now() - mountedAt.current}ms`);
+      }
       if (!hasStartedOnboarding) {
         router.replace('/login');
       } else if (hasCompletedOnboarding) {
@@ -64,7 +76,7 @@ export default function SplashScreen() {
       } else {
         router.replace('/info');
       }
-    }, 1500);
+    }, remaining);
 
     return () => clearTimeout(timer);
   }, [isLoading, userName, userEmail, authProvider, hasCompletedOnboarding]);

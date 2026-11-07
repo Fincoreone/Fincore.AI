@@ -102,12 +102,23 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         // Load the session token first -- apiFetch reads it synchronously
         // from the in-memory cache, so it must be hydrated before any
         // authenticated request can go out.
-        const storedSessionToken = await loadSessionToken();
-        const storedUserId = await SecureStore.getItemAsync(USER_ID_KEY);
-        const storedUserName = await SecureStore.getItemAsync(USER_NAME_KEY);
-        const storedEmail = await SecureStore.getItemAsync(USER_EMAIL_KEY);
-        const storedProvider = await SecureStore.getItemAsync(AUTH_PROVIDER_KEY);
-        const storedOnboarding = await SecureStore.getItemAsync(ONBOARDING_COMPLETED_KEY);
+        // Each read is a keychain round trip; they are independent, so issue
+        // them together rather than one after another.
+        const [
+          storedSessionToken,
+          storedUserId,
+          storedUserName,
+          storedEmail,
+          storedProvider,
+          storedOnboarding,
+        ] = await Promise.all([
+          loadSessionToken(),
+          SecureStore.getItemAsync(USER_ID_KEY),
+          SecureStore.getItemAsync(USER_NAME_KEY),
+          SecureStore.getItemAsync(USER_EMAIL_KEY),
+          SecureStore.getItemAsync(AUTH_PROVIDER_KEY),
+          SecureStore.getItemAsync(ONBOARDING_COMPLETED_KEY),
+        ]);
 
         // A stored identity with no session token behind it is not a logged-in
         // user. Hydrating the name/email anyway desyncs the two notions of
@@ -127,13 +138,23 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
           setAuthProviderState(storedProvider as AuthProvider);
         }
 
-        // The server is the authority on whether onboarding is done. The local
-        // flag is wiped by any sign-out, so trusting it alone sends a returning
-        // user back through all 60 survey questions and overwrites the scores
-        // already saved against their account.
+        // The local flag is only ever written after the survey is actually
+        // saved, so when it is present it is the answer and there is nothing
+        // to ask the server. This is the common case for every returning
+        // user and it keeps the launch off the network entirely.
+        if (storedOnboarding === 'true') {
+          setHasCompletedOnboarding(true);
+          return;
+        }
+
+        // No local flag: either a fresh install or the flag was wiped by a
+        // sign-out. The server is the authority here. Trusting the missing
+        // flag alone would send a returning user back through all 60 survey
+        // questions and overwrite the scores already saved against their
+        // account, so this one case is worth the round trip.
         const completedOnServer = await hasServerProfile();
-        setHasCompletedOnboarding(completedOnServer || storedOnboarding === 'true');
-        if (completedOnServer && storedOnboarding !== 'true') {
+        setHasCompletedOnboarding(completedOnServer);
+        if (completedOnServer) {
           await SecureStore.setItemAsync(ONBOARDING_COMPLETED_KEY, 'true');
         }
       } catch (error) {
