@@ -923,13 +923,18 @@ async def analyze(request: Request, req: AnalyzeRequest, user_id: str = Depends(
     user_name = req.user_name
     if not user_name:
         try:
-            profile = get_profile(user_id, BUCKET)
+            profile = await asyncio.to_thread(get_profile, user_id, BUCKET)
             user_name = profile.get("name") if profile else None
         except Exception:
             pass  # Fallback to user_id in tracing
 
     try:
-        result = analyze_image(
+        # Bedrock vision takes several seconds. boto3 is synchronous, so calling
+        # it directly from an async route parks the whole event loop -- every
+        # other request (chat streams included) stalls until it returns. Hand it
+        # to a worker thread so the loop keeps serving.
+        result = await asyncio.to_thread(
+            analyze_image,
             image_base64=req.image_base64,
             media_type=req.media_type,
             user_context=req.user_context,
@@ -957,11 +962,12 @@ async def analyze(request: Request, req: AnalyzeRequest, user_id: str = Depends(
             **result
         }
         try:
-            _s3().put_object(
+            await asyncio.to_thread(
+                _s3().put_object,
                 Bucket=BUCKET,
                 Key=key,
                 Body=json.dumps(scan_record),
-                ContentType="application/json"
+                ContentType="application/json",
             )
             logger.info(f"Saved scan {scan_id} for user {user_id}")
         except Exception as e:
@@ -1015,7 +1021,7 @@ async def analyze_text(request: Request, req: AnalyzeTextRequest, user_id: str =
     user_name = req.user_name
     if not user_name:
         try:
-            profile = get_profile(user_id, BUCKET)
+            profile = await asyncio.to_thread(get_profile, user_id, BUCKET)
             user_name = profile.get("name") if profile else None
         except Exception:
             pass
@@ -1032,7 +1038,9 @@ async def analyze_text(request: Request, req: AnalyzeTextRequest, user_id: str =
 
         prompt = TEXT_ANALYSIS_PROMPT.format(product_description=req.product_description)
 
-        response = bedrock.invoke_model(
+        # Same as /analyze: synchronous boto3 call, run it off the event loop.
+        response = await asyncio.to_thread(
+            bedrock.invoke_model,
             modelId=os.getenv("BEDROCK_TEXT_MODEL_ID", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"),
             contentType="application/json",
             accept="application/json",
@@ -1043,7 +1051,7 @@ async def analyze_text(request: Request, req: AnalyzeTextRequest, user_id: str =
             }),
         )
 
-        response_body = json.loads(response["body"].read())
+        response_body = json.loads(await asyncio.to_thread(response["body"].read))
         content = response_body["content"][0]["text"]
 
         # Parse JSON from response (handle markdown code blocks)
@@ -1066,7 +1074,8 @@ async def analyze_text(request: Request, req: AnalyzeTextRequest, user_id: str =
             **result,
         }
         try:
-            _s3().put_object(
+            await asyncio.to_thread(
+                _s3().put_object,
                 Bucket=BUCKET,
                 Key=key,
                 Body=json.dumps(scan_record),
@@ -1118,7 +1127,7 @@ class PsychologyCostRequest(BaseModel):
 
 @app.post("/psychology-cost")
 async def get_psychology_cost(req: PsychologyCostRequest, user_id: str = Depends(get_current_user)):
-    profile = get_profile(user_id, BUCKET)
+    profile = await asyncio.to_thread(get_profile, user_id, BUCKET)
     if not profile or not profile.get("big_five"):
         raise HTTPException(status_code=400, detail="Complete quiz first")
 
@@ -1207,12 +1216,13 @@ async def upload_scan_image(req: UploadScanImageRequest, user_id: str = Depends(
         # Construct S3 key
         s3_key = f"users/{user_id}/scans/{req.scan_id}/original.jpg"
 
-        # Upload to S3
-        _s3().put_object(
+        # Upload to S3 (off the event loop -- this is a photo, not a few bytes)
+        await asyncio.to_thread(
+            _s3().put_object,
             Bucket=BUCKET,
             Key=s3_key,
             Body=image_bytes,
-            ContentType="image/jpeg"
+            ContentType="image/jpeg",
         )
 
         # Construct the S3 URL
@@ -1220,9 +1230,9 @@ async def upload_scan_image(req: UploadScanImageRequest, user_id: str = Depends(
         s3_url = f"https://{BUCKET}.s3.{region}.amazonaws.com/{s3_key}"
 
         # Optionally update the scan record with the image URL
-        scan = get_scan(user_id, req.scan_id, BUCKET)
+        scan = await asyncio.to_thread(get_scan, user_id, req.scan_id, BUCKET)
         if scan:
-            update_scan(user_id, req.scan_id, {"image_url": s3_url}, BUCKET)
+            await asyncio.to_thread(update_scan, user_id, req.scan_id, {"image_url": s3_url}, BUCKET)
 
         return UploadScanImageResponse(success=True, s3_url=s3_url)
 
