@@ -100,6 +100,28 @@ export function useChat({
       let firstChunk = true;
       let fullContent = '';
 
+      // Bedrock delivers many small chunks a second. Pushing each one into
+      // state re-renders the whole conversation per chunk, which is what made
+      // long chats stutter while Faith typed. Coalesce: mark dirty, flush at
+      // most once per animation frame -- the screen cannot show more anyway.
+      let flushHandle: number | null = null;
+      const flush = () => {
+        flushHandle = null;
+        const { cleanContent: streamContent } = parseSuggestions(fullContent);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === assistantId ? { ...m, content: streamContent } : m))
+        );
+      };
+      const scheduleFlush = () => {
+        if (flushHandle === null) flushHandle = requestAnimationFrame(flush);
+      };
+      const cancelFlush = () => {
+        if (flushHandle !== null) {
+          cancelAnimationFrame(flushHandle);
+          flushHandle = null;
+        }
+      };
+
       // Close any existing connection
       eventSourceRef.current?.close();
 
@@ -123,6 +145,7 @@ export function useChat({
         const data = event.data;
 
         if (data === '[DONE]') {
+          cancelFlush();
           es.close();
           setIsTyping(false);
 
@@ -142,11 +165,12 @@ export function useChat({
           const chunk = JSON.parse(data) as string;
           fullContent += chunk;
 
-          const { cleanContent: streamContent } = parseSuggestions(fullContent);
-
           if (firstChunk) {
+            // First chunk goes straight through so the typing indicator is
+            // replaced by the bubble the instant Faith starts.
             firstChunk = false;
             setIsTyping(false);
+            const { cleanContent: streamContent } = parseSuggestions(fullContent);
             setMessages((prev) => [
               ...prev,
               {
@@ -158,17 +182,14 @@ export function useChat({
               },
             ]);
           } else {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantId ? { ...m, content: streamContent } : m
-              )
-            );
+            scheduleFlush();
           }
         } catch (e) {
         }
       });
 
       es.addEventListener('error', (event: any) => {
+        cancelFlush();
         es.close();
         setIsTyping(false);
 
@@ -185,10 +206,12 @@ export function useChat({
             },
           ]);
         } else {
-          // Mark existing message as done
+          // Mark existing message as done, with whatever text arrived before
+          // the drop (a flush may still have been pending).
+          const { cleanContent } = parseSuggestions(fullContent);
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === assistantId ? { ...m, streaming: false } : m
+              m.id === assistantId ? { ...m, content: cleanContent, streaming: false } : m
             )
           );
         }
