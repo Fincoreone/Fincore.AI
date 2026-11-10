@@ -1,5 +1,6 @@
-import React, { useRef, useEffect } from 'react';
-import { View, StyleSheet, Animated } from 'react-native';
+import React, { useRef, useEffect, useState, useContext } from 'react';
+import { View, StyleSheet, Animated, AppState, type AppStateStatus } from 'react-native';
+import { NavigationContext } from '@react-navigation/native';
 import Svg, { Path, Defs, LinearGradient, Stop, ClipPath, Rect, G } from 'react-native-svg';
 import { useTheme } from '../contexts/ThemeContext';
 import type { WaveStop } from '../styles/theme';
@@ -34,6 +35,48 @@ const WAVE_MOTION = [
   { duration: 5000, delay: 1500, travel: -6 },
 ];
 
+/**
+ * True while the enclosing navigator screen is focused. The tab navigator
+ * keeps every visited tab mounted, so without this each tab's waves keep
+ * animating (and compositing five full-screen layers a frame) while hidden.
+ *
+ * Same logic as @react-navigation's useIsFocused, but tolerant of being
+ * rendered outside any navigator, where it simply reports focused.
+ */
+function useScreenFocused(): boolean {
+  const navigation = useContext(NavigationContext);
+  const [focused, setFocused] = useState(() => (navigation ? navigation.isFocused() : true));
+
+  useEffect(() => {
+    if (!navigation) return;
+    setFocused(navigation.isFocused());
+    const unsubFocus = navigation.addListener('focus', () => setFocused(true));
+    const unsubBlur = navigation.addListener('blur', () => setFocused(false));
+    return () => {
+      unsubFocus();
+      unsubBlur();
+    };
+  }, [navigation]);
+
+  return focused;
+}
+
+/** True while the app is in the foreground. 'unknown' is only the initial read. */
+function isForeground(state: AppStateStatus): boolean {
+  return state === 'active' || state === 'unknown';
+}
+
+function useAppForeground(): boolean {
+  const [foreground, setForeground] = useState(() => isForeground(AppState.currentState));
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => setForeground(isForeground(next)));
+    return () => sub.remove();
+  }, []);
+
+  return foreground;
+}
+
 export function WaveBackground({ prefix = 'wave', waves = 4, animated = true }: WaveBackgroundProps) {
   const t = useTheme();
   // react-native-svg registers <Defs> by id. If only the <Stop> colours change
@@ -43,20 +86,41 @@ export function WaveBackground({ prefix = 'wave', waves = 4, animated = true }: 
   const ns = `${prefix}-${t.isDark ? 'dark' : 'light'}`;
   const anims = useRef(WAVE_MOTION.map(() => new Animated.Value(0))).current;
 
+  const screenFocused = useScreenFocused();
+  const appForeground = useAppForeground();
+  // Only drive the loops while someone can actually see them.
+  const running = animated && screenFocused && appForeground;
+
   useEffect(() => {
-    if (!animated) return;
+    if (!running) return;
+
+    if (__DEV__) console.log(`[waves] ${prefix}: start`);
+
+    // Hold on to every loop we start so the cleanup can stop it. The previous
+    // version only cleared the start-up timers, so once a loop was running it
+    // ran until the app was killed, even after its view had gone.
+    const loops: Animated.CompositeAnimation[] = [];
     const timers = WAVE_MOTION.slice(0, waves).map((m, i) =>
       setTimeout(() => {
-        Animated.loop(
+        const loop = Animated.loop(
           Animated.sequence([
             Animated.timing(anims[i], { toValue: 1, duration: m.duration / 2, useNativeDriver: true }),
             Animated.timing(anims[i], { toValue: 0, duration: m.duration / 2, useNativeDriver: true }),
           ])
-        ).start();
+        );
+        loops.push(loop);
+        loop.start();
       }, m.delay)
     );
-    return () => timers.forEach(clearTimeout);
-  }, [animated, waves, anims]);
+
+    return () => {
+      timers.forEach(clearTimeout);
+      // stop() leaves each Animated.Value where it is, so the waves freeze in
+      // place on blur and pick up from there on focus rather than jumping.
+      loops.forEach((loop) => loop.stop());
+      if (__DEV__) console.log(`[waves] ${prefix}: stop`);
+    };
+  }, [running, waves, anims, prefix]);
 
   const waveStops: WaveStop[][] = [t.waves.wave1, t.waves.wave2, t.waves.wave3, t.waves.wave4].map(
     (w) => [...w]
@@ -119,8 +183,14 @@ export function WaveBackground({ prefix = 'wave', waves = 4, animated = true }: 
         );
 
         return animated ? (
+          // Rasterise each moving layer once and let the compositor slide the
+          // bitmap, instead of re-rendering a full-screen SVG curve every
+          // frame. The layer's content never changes while it animates, which
+          // is exactly the case these flags are for.
           <Animated.View
             key={i}
+            shouldRasterizeIOS
+            renderToHardwareTextureAndroid
             style={[StyleSheet.absoluteFill, { overflow: 'hidden' }, layerStyle]}
           >
             {layer}

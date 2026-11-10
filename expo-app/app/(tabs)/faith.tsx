@@ -20,7 +20,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
 import { ComingSoonModal } from '../../components/ComingSoonModal';
 import { HistoryDrawer } from '../../components/HistoryDrawer';
-import { useChat } from '../../hooks/useChat';
+import { useChat, type ChatMessage } from '../../hooks/useChat';
 import { API_BASE_URL } from '../../config';
 import { apiPost } from '../../lib/api';
 import { formatCurrency } from '../../lib/format';
@@ -88,6 +88,101 @@ function TypingIndicator() {
     </View>
   );
 }
+
+/**
+ * One chat bubble. Memoised so that, while Faith's reply streams in, only the
+ * bubble receiving text re-renders. The hook keeps every other message object
+ * by identity, so a shallow prop compare is enough to skip them.
+ *
+ * `insightCard` is only ever present on the demo data below; kept so that
+ * branch renders exactly as before.
+ */
+type BubbleMessage = ChatMessage & { insightCard?: Message['insightCard'] };
+
+let bubbleRenders = 0; // __DEV__ only: counted per reply, see FaithScreen
+
+const MessageBubble = React.memo(function MessageBubble({
+  msg,
+  t,
+  styles,
+}: {
+  msg: BubbleMessage;
+  t: Theme;
+  styles: ReturnType<typeof makeStyles>;
+}) {
+  if (__DEV__) bubbleRenders += 1;
+
+  const time = useMemo(
+    () => msg.timestamp.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+    [msg.timestamp]
+  );
+
+  if (msg.role === 'user') {
+    return (
+      <View style={styles.userMessageContainer}>
+        <View style={styles.userBubble}>
+          <Text style={styles.userText}>{msg.content}</Text>
+        </View>
+        <Text style={styles.userTime}>{time}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.assistantMessageContainer}>
+      <View style={styles.faithAvatar}>
+        <LinearGradient colors={t.gradients.avatarReversed} style={styles.faithAvatarGradient}>
+          <Text style={styles.faithAvatarText}>F</Text>
+        </LinearGradient>
+      </View>
+      <View style={styles.assistantBubbleContainer}>
+        <View style={styles.assistantBubble}>
+          <Text style={styles.assistantText}>{msg.content}</Text>
+
+          {msg.insightCard && (
+            <View style={styles.insightCard}>
+              <View style={styles.insightHeader}>
+                <View style={styles.insightIconContainer}>
+                  <ChartIcon />
+                </View>
+                <Text style={styles.insightTitle}>{msg.insightCard.title}</Text>
+              </View>
+              <View style={styles.insightItems}>
+                {msg.insightCard.items.map((item) => (
+                  <View key={item.label} style={styles.insightItem}>
+                    <View style={styles.insightItemHeader}>
+                      <Text style={styles.insightItemLabel}>{item.label}</Text>
+                      <Text style={styles.insightItemAmount}>{item.amount}</Text>
+                    </View>
+                    <View style={styles.insightBarBg}>
+                      <LinearGradient
+                        colors={t.gradients.avatar}
+                        start={{ x: 0, y: 0 }}
+                        end={{ x: 1, y: 0 }}
+                        style={[styles.insightBar, { width: `${item.pct}%` }]}
+                      />
+                    </View>
+                  </View>
+                ))}
+              </View>
+              <View style={styles.insightTotal}>
+                <Text style={styles.insightTotalLabel}>Total</Text>
+                <Text style={styles.insightTotalAmount}>{msg.insightCard.total}</Text>
+              </View>
+            </View>
+          )}
+
+          {msg.insightCard && (
+            <Text style={[styles.assistantText, { marginTop: 12 }]}>
+              That's <Text style={styles.boldText}>23% above</Text> your average. I'd suggest a weekly cap of £80. Shall I set that up?
+            </Text>
+          )}
+        </View>
+        <Text style={styles.assistantTime}>{time}</Text>
+      </View>
+    </View>
+  );
+});
 
 const initialMessages: Message[] = [
   {
@@ -237,14 +332,29 @@ export default function FaithScreen() {
     }
   }, [params.scanContext, params.profileQuestion, startNewSession, sendMessage]);
 
-  const messages: Message[] = chatMessages.map((m) => ({
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    time: m.timestamp.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-  }));
+  // Dev-only instrumentation: how many state flushes and bubble renders one
+  // streamed reply cost. Before memoisation, renders = flushes x messages.
+  const streamStatsRef = useRef({ streaming: false, flushes: 0 });
+  useEffect(() => {
+    if (!__DEV__) return;
+    const stats = streamStatsRef.current;
+    const streaming = chatMessages.some((m) => m.streaming);
+    if (streaming) {
+      if (!stats.streaming) {
+        stats.flushes = 0;
+        bubbleRenders = 0;
+      }
+      stats.flushes += 1;
+    } else if (stats.streaming) {
+      console.log(
+        `[chat] reply done: ${stats.flushes} flushes, ${bubbleRenders} bubble renders, ` +
+          `${chatMessages.length} messages on screen`
+      );
+    }
+    stats.streaming = streaming;
+  }, [chatMessages]);
 
-  const showEmpty = messages.length === 0 && !isTyping && !isLoadingSession;
+  const showEmpty = chatMessages.length === 0 && !isTyping && !isLoadingSession;
 
   const handleSuggestion = (text: string) => {
     sendMessage(text);
@@ -405,77 +515,15 @@ export default function FaithScreen() {
               </View>
             </View>
 
-            {messages.map((msg) => (
-              <View key={msg.id}>
-                {msg.role === 'user' ? (
-                  <View style={styles.userMessageContainer}>
-                    <View style={styles.userBubble}>
-                      <Text style={styles.userText}>{msg.content}</Text>
-                    </View>
-                    <Text style={styles.userTime}>{msg.time}</Text>
-                  </View>
-                ) : (
-                  <View style={styles.assistantMessageContainer}>
-                    <View style={styles.faithAvatar}>
-                      <LinearGradient colors={t.gradients.avatarReversed} style={styles.faithAvatarGradient}>
-                        <Text style={styles.faithAvatarText}>F</Text>
-                      </LinearGradient>
-                    </View>
-                    <View style={styles.assistantBubbleContainer}>
-                      <View style={styles.assistantBubble}>
-                        <Text style={styles.assistantText}>{msg.content}</Text>
-
-                        {msg.insightCard && (
-                          <View style={styles.insightCard}>
-                            <View style={styles.insightHeader}>
-                              <View style={styles.insightIconContainer}>
-                                <ChartIcon />
-                              </View>
-                              <Text style={styles.insightTitle}>{msg.insightCard.title}</Text>
-                            </View>
-                            <View style={styles.insightItems}>
-                              {msg.insightCard.items.map((item) => (
-                                <View key={item.label} style={styles.insightItem}>
-                                  <View style={styles.insightItemHeader}>
-                                    <Text style={styles.insightItemLabel}>{item.label}</Text>
-                                    <Text style={styles.insightItemAmount}>{item.amount}</Text>
-                                  </View>
-                                  <View style={styles.insightBarBg}>
-                                    <LinearGradient
-                                      colors={t.gradients.avatar}
-                                      start={{ x: 0, y: 0 }}
-                                      end={{ x: 1, y: 0 }}
-                                      style={[styles.insightBar, { width: `${item.pct}%` }]}
-                                    />
-                                  </View>
-                                </View>
-                              ))}
-                            </View>
-                            <View style={styles.insightTotal}>
-                              <Text style={styles.insightTotalLabel}>Total</Text>
-                              <Text style={styles.insightTotalAmount}>{msg.insightCard.total}</Text>
-                            </View>
-                          </View>
-                        )}
-
-                        {msg.insightCard && (
-                          <Text style={[styles.assistantText, { marginTop: 12 }]}>
-                            That's <Text style={styles.boldText}>23% above</Text> your average. I'd suggest a weekly cap of £80. Shall I set that up?
-                          </Text>
-                        )}
-                      </View>
-                      <Text style={styles.assistantTime}>{msg.time}</Text>
-                    </View>
-                  </View>
-                )}
-              </View>
+            {chatMessages.map((msg) => (
+              <MessageBubble key={msg.id} msg={msg} t={t} styles={styles} />
             ))}
 
             {/* Typing indicator */}
             {isTyping && <TypingIndicator />}
 
             {/* Quick replies - dynamic based on Faith's response */}
-            {messages.length > 0 && !isTyping && quickReplies.length > 0 && (
+            {chatMessages.length > 0 && !isTyping && quickReplies.length > 0 && (
               <View style={styles.quickReplies}>
                 {quickReplies.map((reply) => (
                   <TouchableOpacity key={reply} style={styles.quickReplyButton} onPress={() => sendMessage(reply)}>
